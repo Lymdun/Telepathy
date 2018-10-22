@@ -6,21 +6,36 @@ namespace Telepathy
 {
     public class Client : Common
     {
-        TcpClient client = new TcpClient();
+        TcpClient client;
         Thread thread;
-
-        public bool Connecting
-        {
-            get { return thread != null && thread.IsAlive && !client.Connected; }
-        }
 
         public bool Connected
         {
-            get { return thread != null && thread.IsAlive && client.Connected; }
+            get
+            {
+                // TcpClient.Connected doesn't check if socket != null, which
+                // results in NullReferenceExceptions if connection was closed.
+                // -> let's check it manually instead
+                return client != null &&
+                       client.Client != null &&
+                       client.Client.Connected;
+            }
+        }
+
+        // there is no easy way to check if TcpClient is connecting:
+        // - TcpClient has no flag for that
+        // - using a 'bool connecting' would require locks and lots of special
+        //   cases in case of exceptions/disconect calls etc.
+        // => checking if the thread is running (while not connected yet) is the
+        //    easiest and 100% reliable solution. no race conditions or locks.
+        public bool Connecting
+        {
+            get { return thread != null && thread.IsAlive && !Connected; }
         }
 
         // the thread function
-        void ThreadFunction(string ip, int port)
+        // (static to reduce state for maximum reliability)
+        static void ThreadFunction(TcpClient client, string ip, int port, SafeQueue<Message> messageQueue)
         {
             // absolutely must wrap with try/catch, otherwise thread
             // exceptions are silent
@@ -32,7 +47,7 @@ namespace Telepathy
                 client.Connect(ip, port);
 
                 // run the receive loop
-                ReceiveLoop(0, client);
+                ReceiveLoop(0, client, messageQueue);
             }
             catch (SocketException exception)
             {
@@ -40,20 +55,30 @@ namespace Telepathy
                 // but there is no server running on that ip/port
                 Logger.Log("Client: failed to connect to ip=" + ip + " port=" + port + " reason=" + exception);
 
-                // clean up properly before exiting
-                client.Close();
+                // add 'Disconnected' event to message queue so that the caller
+                // knows that the Connect failed. otherwise they will never know
+                messageQueue.Enqueue(new Message(0, EventType.Disconnected, null));
             }
             catch (Exception exception)
             {
                 // something went wrong. probably important.
                 Logger.LogError("Client Exception: " + exception);
             }
+
+            // if we got here then we are done. ReceiveLoop cleans up already,
+            // but we may never get there if connect fails. so let's clean up
+            // here too.
+            client.Close();
         }
 
         public void Connect(string ip, int port)
         {
             // not if already started
             if (Connecting || Connected) return;
+
+            // TcpClient can only be used once. need to create a new one each
+            // time.
+            client = new TcpClient();
 
             // clear old messages in queue, just to be sure that the caller
             // doesn't receive data from last time and gets out of sync.
@@ -67,7 +92,7 @@ namespace Telepathy
             //    too long, which is especially good in games
             // -> this way we don't async client.BeginConnect, which seems to
             //    fail sometimes if we connect too many clients too fast
-            thread = new Thread(() => { ThreadFunction(ip, port); });
+            thread = new Thread(() => { ThreadFunction(client, ip, port, messageQueue); });
             thread.IsBackground = true;
             thread.Start();
         }
@@ -75,15 +100,18 @@ namespace Telepathy
         public void Disconnect()
         {
             // only if started
-            if (!Connecting && !Connected) return;
+            if (Connecting || Connected)
+            {
+                // close client
+                client.Close();
 
-            Logger.Log("Client: disconnecting");
+                // wait until thread finished. this is the only way to guarantee
+                // that we can call Connect() again immediately after Disconnect
+                if (thread != null)
+                    thread.Join();
 
-            // this is supposed to disconnect gracefully, but the blocking Read
-            // calls throw a 'Read failure' exception instead of returning 0.
-            // (maybe it's Unity? maybe Mono?)
-            client.GetStream().Close();
-            client.Close();
+                Logger.Log("Client: disconnected");
+            }
         }
 
         public bool Send(byte[] data)

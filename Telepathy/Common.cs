@@ -7,12 +7,6 @@ namespace Telepathy
     public abstract class Common
     {
         // common code /////////////////////////////////////////////////////////
-        // connectionId counter
-        // (right now we only use it from one listener thread, but we might have
-        //  multiple threads later in case of WebSockets etc.)
-        // -> static so that another server instance doesn't start at 0 again.
-        protected static SafeCounter counter = new SafeCounter();
-
         // incoming message queue of <connectionId, message>
         // (not a HashSet because one connection can have multiple new messages)
         protected SafeQueue<Message> messageQueue = new SafeQueue<Message>();
@@ -24,36 +18,45 @@ namespace Telepathy
         // - 100k messages are 1.95MB
         // 2MB are not that much, but it is a bad sign if the caller process
         // can't call GetNextMessage faster than the incoming messages.
-        public int messageQueueSizeWarning = 100000;
-        DateTime messageQueueLastWarning = DateTime.Now;
+        public static int messageQueueSizeWarning = 100000;
 
         // removes and returns the oldest message from the message queue.
         // (might want to call this until it doesn't return anything anymore)
         // -> Connected, Data, Disconnected events are all added here
         // -> bool return makes while (GetMessage(out Message)) easier!
+        // -> no 'is client connected' check because we still want to read the
+        //    Disconnected message after a disconnect
         public bool GetNextMessage(out Message message)
         {
             return messageQueue.TryDequeue(out message);
         }
 
         // static helper functions /////////////////////////////////////////////
-        // fast ushort to byte[] conversion and vice versa
+        // fast int to byte[] conversion and vice versa
         // -> test with 100k conversions:
         //    BitConverter.GetBytes(ushort): 144ms
         //    bit shifting: 11ms
         // -> 10x speed improvement makes this optimization actually worth it
         // -> this way we don't need to allocate BinaryWriter/Reader either
-        static byte[] UShortToBytes(ushort value)
+        // -> 4 bytes because some people may want to send messages larger than 64K bytes
+        static byte[] IntToBytes(int value)
         {
-            return new byte[]
-            {
+            return new byte[] {
                 (byte)value,
-                (byte)(value >> 8)
+                (byte)(value >> 8),
+                (byte)(value >> 16),
+                (byte)(value >> 24)
             };
         }
-        static ushort BytesToUShort(byte[] bytes)
+
+        static int BytesToInt(byte[] bytes )
         {
-            return (ushort)((bytes[1] << 8) + bytes[0]);
+            return
+                bytes[0] |
+                (bytes[1] << 8) |
+                (bytes[2] << 16) |
+                (bytes[3] << 24);
+
         }
 
         // send message (via stream) with the <size,content> message structure
@@ -66,21 +69,22 @@ namespace Telepathy
                 return false;
             }
 
-            // check size
-            if (content.Length > ushort.MaxValue)
-            {
-                Logger.LogError("Send: message too big(" + content.Length + ") max=" + ushort.MaxValue);
-                return false;
-            }
-
-            // stream.Write throws exceptions if client sends with high frequency
-            // and the server stops
+            // stream.Write throws exceptions if client sends with high
+            // frequency and the server stops
             try
             {
-                // write size header and content
-                byte[] header = UShortToBytes((ushort)content.Length);
-                stream.Write(header, 0, header.Length);
-                stream.Write(content, 0, content.Length);
+                // construct header (size)
+                byte[] header = IntToBytes(content.Length);
+
+                // write header+content at once via payload array. writing
+                // header,payload separately would cause 2 TCP packets to be
+                // sent if nagle's algorithm is disabled(2x TCP header overhead)
+                byte[] payload = new byte[header.Length + content.Length];
+                Array.Copy(header, payload, header.Length);
+                Array.Copy(content, 0, payload, header.Length, content.Length);
+                stream.Write(payload, 0, payload.Length);
+
+                // flush to make sure it is being sent immediately
                 stream.Flush();
                 return true;
             }
@@ -97,11 +101,12 @@ namespace Telepathy
         {
             content = null;
 
-            // read exactly 2 bytes for header (blocking)
-            byte[] header = new byte[2];
-            if (!stream.ReadExactly(header, 2))
+            // read exactly 4 bytes for header (blocking)
+            byte[] header = new byte[4];
+            if (!stream.ReadExactly(header, 4))
                 return false;
-            ushort size = BytesToUShort(header);
+
+            int size = BytesToInt(header);
 
             // read exactly 'size' bytes for content (blocking)
             content = new byte[size];
@@ -112,16 +117,21 @@ namespace Telepathy
         }
 
         // thread receive function is the same for client and server's clients
-        protected void ReceiveLoop(uint connectionId, TcpClient client)
+        // (static to reduce state for maximum reliability)
+        protected static void ReceiveLoop(int connectionId, TcpClient client, SafeQueue<Message> messageQueue)
         {
             // get NetworkStream from client
             NetworkStream stream = client.GetStream();
+
+            // keep track of last message queue warning
+            DateTime messageQueueLastWarning = DateTime.Now;
 
             // absolutely must wrap with try/catch, otherwise thread exceptions
             // are silent
             try
             {
-                // add connected event to queue
+                // add connected event to queue with ip address as data in case
+                // it's needed
                 messageQueue.Enqueue(new Message(connectionId, EventType.Connected, null));
 
                 // let's talk about reading data.
